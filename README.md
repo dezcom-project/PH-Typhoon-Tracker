@@ -29,7 +29,7 @@ surface pressure drops below 1000 hPa.
 | Display | 0.96" SSD1306 OLED, 128×64, I2C address `0x3C` |
 | Buzzer | Passive piezo (driven by LEDC PWM square wave) |
 | Button | Momentary push button, internal pull-up |
-| Toolchain | Arduino IDE / arduino-cli, **ESP32 core 3.x** (2.x also supported via automatic LEDC API fallback) |
+| Toolchain | PlatformIO (VS Code extension or `pio` CLI), `espressif32` platform, Arduino framework — **ESP32 core 3.x** (2.x also supported via automatic LEDC API fallback) |
 
 ### Wiring matrix
 
@@ -47,24 +47,19 @@ surface pressure drops below 1000 hPa.
 All logic is 3.3 V. The OLED draws ~20 mA, the buzzer ~10–30 mA — both fine
 from the DevKit's 3V3 regulator.
 
-## Build & flash
+## Build & flash (PlatformIO)
 
-1. Arduino IDE → Boards Manager → install **esp32 by Espressif Systems** (3.x).
-2. Library Manager → install **Adafruit GFX Library**, **Adafruit SSD1306**,
-   **ArduinoJson** (v7).
-3. Edit the USER CONFIGURATION block at the top of
-   `firmware/ph_typhoon_tracker/ph_typhoon_tracker.ino`:
+1. Install the **PlatformIO IDE** extension in VS Code, then open this project
+   folder — `platformio.ini` is detected automatically and all libraries from
+   `lib_deps` (Adafruit GFX, Adafruit SSD1306, ArduinoJson v7) install on the
+   first build.
+2. Edit the USER CONFIGURATION block at the top of `src/main.cpp`:
    - `WIFI_SSID` / `WIFI_PASSWORD` (2.4 GHz networks only)
    - `TARGET_LAT` / `TARGET_LON` — the storm/LPA point to track
-4. Board: **ESP32 Dev Module** (or your exact board), upload at 115200 baud.
-5. Open Serial Monitor @115200 for diagnostics.
-
-CLI equivalent:
-
-```
-arduino-cli compile --fqbn esp32:esp32:esp32 firmware/ph_typhoon_tracker
-arduino-cli upload  --fqbn esp32:esp32:esp32 -p COMx firmware/ph_typhoon_tracker
-```
+3. Build: **PlatformIO: Build** (or `pio run`).
+4. Flash: connect the DevKit over USB and run **PlatformIO: Upload**
+   (or `pio run -t upload`).
+5. Serial monitor @115200 for diagnostics (`pio device monitor`).
 
 ## Coordinate mapping math
 
@@ -141,7 +136,8 @@ public and read-only.
 ## Repository layout
 
 ```
-firmware/ph_typhoon_tracker/   Arduino sketch (single .ino, bitmap embedded)
+platformio.ini                 PlatformIO env (esp32dev, lib_deps, flags)
+src/main.cpp                   Firmware (single file, bitmap embedded)
 tools/gen_map.ps1              Map rasterizer (polygons -> C PROGMEM array)
 tools/ph_map_bitmap.txt        Last generator output (for diffing)
 ```

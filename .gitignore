@@ -1,4 +1,5 @@
 # Build output
+.pio/
 build/
 
 # Editor / OS noise

@@ -16,10 +16,12 @@
  *    There are NO delay() calls anywhere in loop().
  *
  *  Target board : ESP32 DevKit / NodeMCU-32S (any ESP32 variant)
+ *  Build system : PlatformIO (see platformio.ini) - Arduino framework
  *  Framework    : Arduino core for ESP32 (tested against core 3.x API,
  *                 with automatic fallback to the 2.x ledcSetup() API)
  *  Libraries    : Adafruit GFX, Adafruit SSD1306, ArduinoJson v7
- *                 (WiFi.h, HTTPClient.h, Wire.h ship with the core)
+ *                 (WiFi.h, HTTPClient.h, Wire.h ship with the core;
+ *                 lib_deps in platformio.ini installs the rest)
  *
  *  WIRING
  *  ------
@@ -30,6 +32,7 @@
  * ============================================================================
  */
 
+#include <Arduino.h>   // must come first in PlatformIO .cpp builds
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
