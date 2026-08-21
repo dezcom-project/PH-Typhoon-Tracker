@@ -317,14 +317,22 @@ static bool fetchWeather(float &outPressure, float &outWind) {
   http.setConnectTimeout(10000);
   http.setTimeout(15000);
   http.setReuse(false);
+  http.addHeader("Accept-Encoding", "identity");   // refuse gzip/deflate
 
   bool ok = false;
   const int code = http.GET();
   if (code == HTTP_CODE_OK) {
+    // Open-Meteo replies with "Transfer-Encoding: chunked". Only getString()
+    // de-chunks (it routes through writeToStream()); getStream() returns the
+    // RAW wire format, whose hex chunk sizes break the JSON parser.
+    const String payload = http.getString();
+    Serial.printf("[NET] HTTP %d, payload %u bytes\n", code, (unsigned)payload.length());
+
     JsonDocument doc;   // ArduinoJson v7: capacity is allocated dynamically
-    DeserializationError err = deserializeJson(doc, http.getStream());
+    DeserializationError err = deserializeJson(doc, payload);
     if (err) {
       Serial.printf("[NET] JSON error: %s\n", err.c_str());
+      Serial.println("  body[0..119]: " + payload.substring(0, 120));
     } else {
       float p = doc["current"]["surface_pressure"] | NAN;
       float w = doc["current"]["wind_speed_10m"] | NAN;
