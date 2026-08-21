@@ -1,30 +1,29 @@
 # PH Typhoon Tracker
 
-Sensorless Philippines weather & typhoon tracker: an ESP32 + 0.96" SSD1306 OLED
-that renders the Philippine archipelago, tracks a storm/LPA coordinate with an
-animated radar-swirl marker, pulls live pressure/wind from Open-Meteo (no API
-key), and raises a flashing-banner + dual-tone-siren emergency state when
-surface pressure drops below 1000 hPa.
+Sensorless typhoon & LPA tracker for the Philippine Area of Responsibility: an
+ESP32 + 0.96" SSD1306 OLED that renders the PAR map, scans sea-level pressure
+on a 5×5 grid across the entire basin with one Open-Meteo request (no API
+key), and marks any detected low on the map. A weak system shows as an
+`LPA IN PAR` banner with a frozen marker; once central pressure drops below
+1000 hPa it escalates to a flashing `!TYPHOON!` banner and a dual-tone siren.
+No home location is tracked — the device hunts storms, not the user.
 
 ## Features
 
-- **Static map** — 128×64 monochrome Philippines bitmap generated from
-  simplified coastline polygons and stored in flash (`PROGMEM`)
-- **Live telemetry** — surface pressure (hPa) and wind speed (km/h) for any
-  target point in the PAR, refreshed every 10 minutes via Open-Meteo
-- **Cyclone marker** — GPS coordinates mapped to pixels; counter-clockwise
-  swirl animation (northern-hemisphere rotation)
-- **Typhoon alert** — header alternates `!TYPHOON!` / `ALERT <1000`; buzzer
-  plays an alternating 1.2 kHz / 2.4 kHz siren every 250 ms
+- **PAR-wide storm scan** — one multi-point API call samples `pressure_msl`
+  at 25 grid nodes (~280 × 390 km spacing) covering 117–127°E / 7–21°N;
+  local-minimum detection locates the strongest low in the basin
+- **Conditional cyclone marker** — appears only when a low is actually
+  detected, at its estimated position; frozen swirl for an LPA, spinning
+  swirl (northern-hemisphere rotation) once it reaches typhoon strength.
+  Calm weather shows a clean map with no indicator
+- **Tracked-system telemetry** — sidebar shows the detected low's central
+  pressure, model wind, and its 60-minute deepening/filling trend
+- **Typhoon alert** — central pressure < 1000 hPa: header alternates
+  `!TYPHOON!` / `ALERT <1000` and the buzzer plays an alternating
+  1.2 kHz / 2.4 kHz siren every 250 ms
 - **Mute button** — debounced push-button silences the siren while the visual
-  alert keeps flashing; mute auto-clears when pressure recovers ≥ 1000 hPa
-- **Pressure trend** — 60-minute rolling barometer readout (`T:-1.4hPa/h` in
-  the sidebar); a fall of ≥ 2 hPa/h blinks the row as an early warning before
-  the 1000 hPa alert threshold is reached
-- **Storm proximity scan** — one multi-point Open-Meteo request samples
-  sea-level pressure at the target plus a 4-point ring ~275 km out; when the
-  center reads ≥ 2 hPa below the ring (median-smoothed), the header shows a
-  steady `STORM NEAR` banner and an arrow points toward the inferred low
+  alert keeps flashing; mute auto-clears when the system weakens ≥ 1000 hPa
 - **Fully non-blocking** — no `delay()` in `loop()`; everything is scheduled
   with `millis()`
 
@@ -62,13 +61,16 @@ from the DevKit's 3V3 regulator.
    first build.
 2. Create your credentials file (git-ignored, stays out of the repo):
    `Copy-Item include\secrets.h.example include\secrets.h` and fill in
-   `WIFI_SSID` / `WIFI_PASSWORD` (2.4 GHz networks only).
-3. Edit the remaining USER CONFIGURATION block at the top of `src/main.cpp`:
-   - `TARGET_LAT` / `TARGET_LON` — the storm/LPA point to track
-4. Build: **PlatformIO: Build** (or `pio run`).
-5. Flash: connect the DevKit over USB and run **PlatformIO: Upload**
+   `WIFI_SSID` / `WIFI_PASSWORD` (2.4 GHz networks only). That is the only
+   configuration required — there is no location to set.
+3. Build: **PlatformIO: Build** (or `pio run`).
+4. Flash: connect the DevKit over USB and run **PlatformIO: Upload**
    (or `pio run -t upload`).
-6. Serial monitor @115200 for diagnostics (`pio device monitor`).
+5. Serial monitor @115200 for diagnostics (`pio device monitor`).
+
+Optional tuning constants live at the top of `src/main.cpp`:
+`ALERT_PRESSURE_HPA` (alert threshold), `DEFICIT_LOW_HPA` (detection
+sensitivity), `GRID_*` (scan coverage).
 
 ## Coordinate mapping math
 
@@ -81,21 +83,60 @@ X = round((lon − 116.0°E) × 127 / (127.0 − 116.0))     116°E → x=0 … 
 Y = round((21.5°N − lat) × 63 / (21.5 − 4.5))          21.5°N → y=0 …  4.5°N → y=63
 ```
 
-Example — Manila (14.60°N, 120.98°E):
-
-```
-X = (120.98 − 116) × 127 / 11 = 57.5  → 58
-Y = (21.5 − 14.60) × 63 / 17 = 25.6  → 26
-```
-
 Resolution works out to ≈0.087°/px in longitude and ≈0.270°/px in latitude,
 so the map is horizontally stretched relative to true Mercator proportions —
-a deliberate trade-off to fill the display, as specified. The bitmap itself
-was rasterized from coastline polygons using these exact formulas
-(`tools/gen_map.ps1`, regenerate with
-`powershell -File tools/gen_map.ps1`). The header band overlays the top rows
-(Batanes sits under it) and the telemetry sidebar overlays the lower-left
-(Sulu Sea/Palawan area).
+a deliberate trade-off to fill the display. The bitmap was rasterized from
+coastline polygons using these exact formulas (`tools/gen_map.ps1`,
+regenerate with `powershell -File tools/gen_map.ps1`). Detected storm
+positions use the same two functions to land the cyclone marker on the map.
+
+## PAR storm scan
+
+Every 10 minutes the device fetches `pressure_msl` at 25 nodes in **one**
+request (Open-Meteo accepts comma-separated coordinate lists; lists pair up
+element-by-element, so the firmware emits all 25 lat/lon combinations).
+
+Detection (`detectLow` in `src/main.cpp`):
+
+1. Find the minimum-pressure node on the grid.
+2. Average its surrounding nodes (up to 8). The minimum must sit at least
+   **2.5 hPa below** that average — this rejects broad monsoon troughs,
+   where the whole field sinks together and no single center stands out.
+   Validated live: the NW Luzon trough produces a ~2 hPa smooth ramp
+   (rejected); a tropical depression punches a localized 5+ hPa dent.
+3. Refine position with a deficit-weighted centroid of the 3×3 block,
+   pulling the estimate between nodes toward the true minimum.
+
+Position accuracy is limited by grid spacing: expect ±150–300 km. This is
+inference from the model pressure field, not an official PAGASA track —
+treat it as "an organized low is inside the PAR near here", not a forecast.
+
+`pressure_msl` is mandatory, not `surface_pressure`: raw surface pressure
+tracks terrain elevation, so grid nodes over the Cordillera (~1800 m) read
+~90 hPa "low" in perfectly fair weather (measured: 904 hPa raw vs 1013 hPa
+sea-level-reduced at the same spot).
+
+## Alert states
+
+| Condition | Header | Marker | Buzzer |
+| --- | --- | --- | --- |
+| No low detected | `PH TYPHOON TRACKER` + Wi-Fi pip | none | silent |
+| Low detected, central ≥ 1000 hPa | steady `LPA IN PAR` | frozen swirl at estimated position | silent |
+| Central < 1000 hPa | alternates `!TYPHOON!` (inverted) / `ALERT <1000` every 600 ms | spinning swirl | 1.2 kHz ↔ 2.4 kHz every 250 ms |
+| Central < 1000 hPa, muted | steady `TYPH [MUTED]` | spinning swirl | silent |
+
+Severity hierarchy: LPA tracking is informational and silent; the alert state
+flashes and sounds. If a fetch fails, the last known state stays on screen
+and the scan retries after 1 minute instead of waiting the full 10.
+
+### Telemetry sidebar
+
+`P:` and `W:` refer to the **tracked system** (estimated central pressure
+and model wind at the low), not to any home location. `T:` is the change in
+central pressure over the last 60 minutes (7 samples): negative means the
+system is deepening. A deepening rate of ≥ 2 hPa/h blinks the row. The row
+stays blank until an hour of tracking has accumulated, and history resets
+when a system dissipates or leaves the grid.
 
 ## Debounce logic
 
@@ -115,82 +156,32 @@ subtraction, it is immune to the `millis()` rollover after ~49 days.
 
 Pressing during an alert toggles `isMuted`; the buzzer stops immediately but
 the banner keeps alternating. Outside an alert the press is ignored, and a
-fresh reading ≥ 1000 hPa force-clears the mute (auto-reset).
-
-## Alert system
-
-| Condition | Header | Buzzer |
-| --- | --- | --- |
-| P ≥ 1000 hPa, no scan hit | `PH TYPHOON TRACKER` + Wi-Fi pip | silent |
-| Ring−center deficit ≥ 2 hPa (smoothed) | steady `STORM NEAR` + bearing arrow | silent |
-| P < 1000 hPa | alternates `!TYPHOON!` (inverted) / `ALERT <1000` every 600 ms | 1.2 kHz ↔ 2.4 kHz every 250 ms |
-| P < 1000 hPa, muted | steady `TYPH [MUTED]` | silent |
-
-Severity hierarchy: `STORM NEAR` is informational and steady; the full alert
-flashes and sounds. If both conditions hold, the alert banner wins.
-
-### Storm proximity scan
-
-Every fetch also samples **sea-level-reduced pressure** (`pressure_msl`) at
-five points in one request: the target plus N/E/S/W ring points 2.5° away
-(~275 km; the longitude step is widened by 1/cos(lat) to keep ground
-distances equal). The deficit `mean(ring) − center` isolates a local deep
-low: diurnal and broad-scale pressure swings lift all five points together
-and cancel out.
-
-- Raw deficits pass through a **median-of-3 filter** (3 scans ≈ 30 min), so
-  the state needs half an hour of uptime and single glitches can't trip it
-- Deficit ≥ 2 hPa → `STORM NEAR`, and the arrow on the map points at the
-  lowest ring sector — a rough bearing *toward* the low
-- `pressure_msl` is mandatory here, not `surface_pressure`: raw surface
-  pressure tracks terrain elevation, so a ring point over the Cordillera
-  (~1800 m) reads ~90 hPa "low" in perfectly fair weather
-
-This is inference from the pressure field, not an official storm position —
-treat it as a hint that something organized is within roughly ring distance,
-not a track forecast.
-
-Threshold applies to Open-Meteo's `surface_pressure`. At coastal targets that
-tracks sea-level pressure closely; if you place the target at altitude,
-consider swapping the query field to `pressure_msl`.
-
-### Early warning: pressure trend
-
-The sidebar's third row shows the surface-pressure change over the last
-60 minutes (7 samples, one per 10-minute fetch). It stays blank until a full
-hour of history has accumulated after boot — that is normal, not a fault.
-A sustained fall is the classic advance signal of an approaching low; once
-the drop reaches **2 hPa/h or faster**, the row blinks (400 ms period) to
-flag it before the 1000 hPa alert state itself triggers. The tracked
-coordinates were moved to the boot splash to make room for this row.
+weakened system (≥ 1000 hPa) force-clears the mute (auto-reset).
 
 ## API notes
 
-Request (no key) — single point, used for the display/alert pressure:
+Single request, no key, 25 locations (abbreviated here — the firmware emits
+all combinations):
 
 ```
-https://api.open-meteo.com/v1/forecast?latitude=14.60&longitude=120.98&current=surface_pressure,wind_speed_10m&wind_speed_unit=kmh
+https://api.open-meteo.com/v1/forecast?latitude=21.0,21.0,...,7.0&longitude=117.0,119.5,...,127.0&current=pressure_msl,wind_speed_10m&wind_speed_unit=kmh
 ```
 
-The storm scan uses the same endpoint with **comma-separated coordinates**,
-which returns a JSON *array* of per-location objects (one HTTPS round trip
-for all five points):
+Gotchas learned the hard way:
 
-```
-https://api.open-meteo.com/v1/forecast?latitude=14.60,17.10,...&longitude=120.98,120.98,...&current=pressure_msl,surface_pressure,wind_speed_10m&wind_speed_unit=kmh
-```
+- **Chunked responses.** Open-Meteo replies with `Transfer-Encoding: chunked`
+  and no `Content-Length`. The body must be read with `http.getString()`,
+  which de-chunks via `HTTPClient::writeToStream()`; parsing
+  `http.getStream()` directly feeds the raw hex chunk sizes to the JSON
+  parser and fails with `InvalidInput`. The request also sends
+  `Accept-Encoding: identity` so the server never compresses the payload.
+- **Coordinate lists are pairwise**, not cartesian: N lats + M lons yields
+  min(N, M) locations. Emit every row/column combination explicitly.
+- **URL length.** The 25-point URL is ~520 characters — size the request
+  buffer with headroom or `snprintf` truncates the query silently.
 
-Responses are sanity-checked (850–1100 hPa, 0–500 km/h) before being trusted;
-failed fetches keep the last good values on screen and retry after 1 minute
-instead of waiting the full 10. TLS uses `setInsecure()` since the endpoint is
-public and read-only.
-
-**Gotcha: chunked responses.** Open-Meteo replies with
-`Transfer-Encoding: chunked` and no `Content-Length`. The body must be read
-with `http.getString()`, which de-chunks via `HTTPClient::writeToStream()`;
-parsing `http.getStream()` directly feeds the raw hex chunk sizes to the JSON
-parser and fails with `InvalidInput`. The request also sends
-`Accept-Encoding: identity` so the server never compresses the payload.
+All returned values are sanity-checked (850–1100 hPa, 0–500 km/h) before
+being trusted; any out-of-range node discards the whole scan.
 
 ## Repository layout
 

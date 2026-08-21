@@ -7,7 +7,9 @@
  *  - Live surface pressure / wind speed for a target point in the Philippine
  *    Area of Responsibility (PAR), fetched from the Open-Meteo REST API
  *    (free, no API key) every 10 minutes
- *  - Animated radar-swirl cyclone marker mapped from GPS coordinates
+ *  - Cyclone marker appears ONLY when a disturbance is indicated: offset
+ *    along the inferred bearing (STORM NEAR) or at the target itself
+ *    (full alert). Calm weather shows a plain crosshair reticle instead.
  *  - Emergency state when surface pressure drops below 1000 hPa:
  *      * flashing "!TYPHOON!" / "ALERT <1000" header banner
  *      * dual-tone siren (1.2 kHz <-> 2.4 kHz, 250 ms alternation)
@@ -58,12 +60,8 @@
   #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
 #endif
 
-// Target point inside the PAR that is tracked and sampled.
-// Default: Metro Manila. Move this to any storm/LPA coordinate you want.
-#define TARGET_LAT      14.60f               // degrees North
-#define TARGET_LON      120.98f              // degrees East
-
-// Alert threshold: emergency state below this surface pressure (hPa)
+// Alert threshold: emergency state when a DETECTED system's central
+// (sea-level-reduced) pressure drops below this value (hPa)
 #define ALERT_PRESSURE_HPA  1000.0f
 
 /* ---------------- Pin map ---------------- */
@@ -93,10 +91,17 @@ const unsigned long DEBOUNCE_MS       = 50UL;      // button debounce time
 const float TREND_FAST_HPA_H = 2.0f;        // faster fall blinks the row
 const unsigned long TREND_BLINK_MS = 400UL; // fast-fall blink period
 
-/* ---------------- Storm proximity scan ---------------- */
-const float SCAN_RADIUS_DEG  = 2.5f;        // ring radius, ~275 km on ground
-const float DEFICIT_NEAR_HPA = 2.0f;        // smoothed deficit -> STORM NEAR
-const uint8_t SCAN_POINTS    = 5;           // target + N, E, S, W
+/* ---------------- PAR storm scan grid ---------------- */
+// 5x5 nodes, 2.5 deg longitude x 3.5 deg latitude apart (~280 x 390 km),
+// covering 117..127E / 21..7N: the main cyclogenesis corridor of the PAR.
+const uint8_t GRID_COLS      = 5;
+const uint8_t GRID_ROWS      = 5;
+const uint8_t GRID_POINTS    = GRID_COLS * GRID_ROWS;
+const float GRID_LON_MIN     = 117.0f;
+const float GRID_LON_STEP    = 2.5f;
+const float GRID_LAT_MAX     = 21.0f;    // top row latitude
+const float GRID_LAT_STEP    = 3.5f;     // rows run southward
+const float DEFICIT_LOW_HPA  = 2.5f;     // node-vs-neighbors dip -> low
 
 /* ---------------- Siren tones (Hz) ---------------- */
 const unsigned int SIREN_FREQ_LOW  = 1200;
@@ -266,24 +271,19 @@ static_assert(sizeof(PH_MAP) == (SCREEN_WIDTH / 8) * SCREEN_HEIGHT,
  * ============================================================ */
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// Telemetry
-float        g_pressureHpA  = NAN;    // last good surface pressure (hPa)
-float        g_windKmh      = NAN;    // last good wind speed (km/h)
-bool         g_haveData     = false;  // at least one successful fetch
+// Tracked-system telemetry. Everything here refers to the DETECTED low,
+// not to any home location - this device tracks storms, not the user.
+float        g_stormMsl     = NAN;    // estimated central pressure (hPa)
+float        g_stormWind    = NAN;    // model wind at the low (km/h)
+float        g_stormLat     = NAN;    // estimated position of the low
+float        g_stormLon     = NAN;
+bool         g_stormTracked = false;  // a low is currently detected
 bool         g_lastFetchOk  = true;
 bool         g_neverFetched = true;
 unsigned long g_lastFetchMs = 0;
 float        g_trendRate    = 0.0f;   // hPa/h across the last full window
 bool         g_trendValid   = false;  // true once 60 min of history exists
-bool         g_trendFast    = false;  // barometer falling >= TREND_FAST_HPA_H
-
-// Storm-proximity scan state
-float   g_deficit     = NAN;             // smoothed ring-minus-center (hPa)
-bool    g_stormNear   = false;           // smoothed deficit >= DEFICIT_NEAR_HPA
-uint8_t g_stormBearing = 255;            // bearing to lowest sector, deg (255=none)
-float   g_defHist[3]  = {NAN, NAN, NAN};// raw deficits, median-of-3 filter
-uint8_t g_defCount    = 0;
-uint8_t g_defNext     = 0;
+bool         g_trendFast    = false;  // deepening faster than TREND_FAST_HPA_H
 
 // Alert / mute state machine
 bool g_alertActive = false;
@@ -334,45 +334,41 @@ static void pushPressureSample(float p) {
 }
 
 // True once a full hour of samples exists; rate is hPa per hour,
-// positive = rising. Right after a push, g_histNext points at the
-// oldest sample in the window.
+// positive = rising (filling). Right after a push, g_histNext points
+// at the oldest sample in the window.
 static bool pressureTrend(float &rateHpAPerHour) {
   if (g_histCount < TREND_SAMPLES) return false;
-  rateHpAPerHour = g_pressureHpA - g_hist[g_histNext];
+  rateHpAPerHour = g_stormMsl - g_hist[g_histNext];
   return true;
 }
 
 /* ============================================================
- *  NETWORK - Open-Meteo multi-point scan (no API key required)
- *  One request returns all SCAN_POINTS locations as a JSON array:
- *  [0] = target, [1..4] = ring N, E, S, W.
+ *  NETWORK - Open-Meteo PAR grid scan (no API key required)
+ *  One request returns all GRID_POINTS locations as a JSON array,
+ *  row-major: index = row * GRID_COLS + col.
  * ============================================================ */
-static bool fetchScan(float &outSurfP, float &outWind,
-                      float &outCenterMsl, float outRingMsl[4]) {
-  // Ring offsets: latitude step fixed; longitude step widened by
-  // 1/cos(lat) so all four ring points sit at the same ground distance.
-  const float dLat = SCAN_RADIUS_DEG;
-  const float dLon = SCAN_RADIUS_DEG / cosf(TARGET_LAT * DEG_TO_RAD);
-  const float lats[SCAN_POINTS] = { TARGET_LAT, TARGET_LAT + dLat, TARGET_LAT,
-                                    TARGET_LAT - dLat, TARGET_LAT };
-  const float lons[SCAN_POINTS] = { TARGET_LON, TARGET_LON, TARGET_LON + dLon,
-                                    TARGET_LON, TARGET_LON - dLon };
-
-  char url[256];
+static bool fetchParScan(float outMsl[GRID_POINTS], float outWind[GRID_POINTS]) {
+  // 2 x 25 coordinates (~8 chars each) plus base URL and parameters
+  // adds up to ~520 chars - keep generous headroom or snprintf truncates
+  // the query string silently.
+  char url[640];
   snprintf(url, sizeof(url), "%s",
            "https://api.open-meteo.com/v1/forecast?latitude=");
   size_t len = strlen(url);
-  for (uint8_t i = 0; i < SCAN_POINTS; i++)
-    len += snprintf(url + len, sizeof(url) - len, "%.4f,", (double)lats[i]);
+  for (uint8_t r = 0; r < GRID_ROWS; r++)
+    for (uint8_t c = 0; c < GRID_COLS; c++)
+      len += snprintf(url + len, sizeof(url) - len, "%.4f,",
+                      (double)(GRID_LAT_MAX - r * GRID_LAT_STEP));
   url[len - 1] = '\0';                       // drop the trailing comma
   strncat(url, "&longitude=", sizeof(url) - strlen(url) - 1);
   len = strlen(url);
-  for (uint8_t i = 0; i < SCAN_POINTS; i++)
-    len += snprintf(url + len, sizeof(url) - len, "%.4f,", (double)lons[i]);
+  for (uint8_t r = 0; r < GRID_ROWS; r++)
+    for (uint8_t c = 0; c < GRID_COLS; c++)
+      len += snprintf(url + len, sizeof(url) - len, "%.4f,",
+                      (double)(GRID_LON_MIN + c * GRID_LON_STEP));
   url[len - 1] = '\0';
   strncat(url,
-          "&current=pressure_msl,surface_pressure,wind_speed_10m"
-          "&wind_speed_unit=kmh",
+          "&current=pressure_msl,wind_speed_10m&wind_speed_unit=kmh",
           sizeof(url) - strlen(url) - 1);
 
   WiFiClientSecure tls;
@@ -408,84 +404,131 @@ static bool fetchScan(float &outSurfP, float &outWind,
     }
 
     JsonArrayConst arr = doc.as<JsonArrayConst>();
-    if (arr.isNull() || arr.size() < SCAN_POINTS) {
-      Serial.printf("[NET] Expected %u locations in array\n", (unsigned)SCAN_POINTS);
+    if (arr.isNull() || arr.size() < GRID_POINTS) {
+      Serial.printf("[NET] Expected %u locations in array\n", (unsigned)GRID_POINTS);
       return false;
     }
 
-    // Scan pressures MUST be pressure_msl: raw surface_pressure tracks
-    // terrain elevation, so a ring point over mountains would read like a
-    // deep low in perfectly fair weather (measured: 904 hPa vs 1013 msl).
-    float msl[SCAN_POINTS];
-    for (uint8_t i = 0; i < SCAN_POINTS; i++) {
-      msl[i] = arr[i]["current"]["pressure_msl"] | NAN;
-      if (isnan(msl[i]) || msl[i] <= 850.0f || msl[i] >= 1100.0f) {
-        Serial.printf("[NET] Scan point %u out of physical range\n", (unsigned)i);
+    // pressure_msl is mandatory here, NOT surface_pressure: raw surface
+    // pressure tracks terrain elevation, so grid nodes over the Cordillera
+    // would read like deep lows in perfectly fair weather (measured:
+    // 904 hPa raw vs 1013 hPa msl at ~1800 m elevation).
+    for (uint8_t i = 0; i < GRID_POINTS; i++) {
+      outMsl[i]  = arr[i]["current"]["pressure_msl"] | NAN;
+      outWind[i] = arr[i]["current"]["wind_speed_10m"] | NAN;
+      if (isnan(outMsl[i]) || outMsl[i] <= 850.0f || outMsl[i] >= 1100.0f ||
+          isnan(outWind[i]) || outWind[i] < 0.0f || outWind[i] >= 500.0f) {
+        Serial.printf("[NET] Grid point %u out of physical range\n", (unsigned)i);
         return false;
       }
     }
-
-    // Display/alert pressure stays on surface_pressure at the target,
-    // matching the 1000 hPa threshold semantics for a coastal target.
-    outSurfP = arr[0]["current"]["surface_pressure"] | NAN;
-    outWind  = arr[0]["current"]["wind_speed_10m"] | NAN;
-    if (isnan(outSurfP) || outSurfP <= 850.0f || outSurfP >= 1100.0f ||
-        isnan(outWind)  || outWind < 0.0f     || outWind >= 500.0f) {
-      Serial.println("[NET] Values out of physical range, discarded");
-      return false;
-    }
-
-    outCenterMsl = msl[0];
-    for (uint8_t i = 0; i < 4; i++) outRingMsl[i] = msl[i + 1];
     ok = true;
   } else {
     Serial.printf("[NET] HTTP GET failed, code: %d\n", code);
+    http.end();
   }
-  http.end();
   return ok;
 }
 
 /* ============================================================
- *  STORM PROXIMITY SCAN
- *  Compares sea-level-reduced pressure (pressure_msl) at the target
- *  against the mean of four ring points ~275 km out. A deepening low
- *  near the target pulls the center down relative to the ring, while
- *  diurnal and broad-scale swings lift both equally and cancel out.
+ *  PAR STORM SCAN
+ *  Finds the strongest low-pressure signature on the grid. The
+ *  minimum node must sit measurably below its surrounding nodes -
+ *  that rejects broad monsoon troughs, where the whole field sinks
+ *  together and no single center stands out. Position is refined
+ *  with a deficit-weighted centroid of the 3x3 block, pulling the
+ *  estimate between nodes toward the true minimum.
  * ============================================================ */
-static float median3(float a, float b, float c) {
-  return fmaxf(fminf(a, b), fminf(fmaxf(a, b), c));
+static bool detectLow(const float msl[GRID_POINTS],
+                      float &outLat, float &outLon,
+                      float &outCenterMsl, uint8_t &outMinIdx) {
+  uint8_t mi = 0;
+  for (uint8_t i = 1; i < GRID_POINTS; i++)
+    if (msl[i] < msl[mi]) mi = i;
+
+  const uint8_t mr = mi / GRID_COLS, mc = mi % GRID_COLS;
+
+  float sum = 0.0f;
+  uint8_t cnt = 0;
+  for (int8_t dr = -1; dr <= 1; dr++) {
+    for (int8_t dc = -1; dc <= 1; dc++) {
+      if (dr == 0 && dc == 0) continue;
+      const int8_t r = mr + dr, c = mc + dc;
+      if (r < 0 || r >= GRID_ROWS || c < 0 || c >= GRID_COLS) continue;
+      sum += msl[(uint8_t)r * GRID_COLS + (uint8_t)c];
+      cnt++;
+    }
+  }
+  const float neighAvg = sum / cnt;
+  const float deficit  = neighAvg - msl[mi];
+  if (deficit < DEFICIT_LOW_HPA) return false;
+
+  float wsum = 0.0f, latSum = 0.0f, lonSum = 0.0f;
+  for (int8_t dr = -1; dr <= 1; dr++) {
+    for (int8_t dc = -1; dc <= 1; dc++) {
+      const int8_t r = mr + dr, c = mc + dc;
+      if (r < 0 || r >= GRID_ROWS || c < 0 || c >= GRID_COLS) continue;
+      const uint8_t i = (uint8_t)r * GRID_COLS + (uint8_t)c;
+      const float w = fmaxf(neighAvg - msl[i], 0.0f);   // center w = deficit > 0
+      wsum   += w;
+      latSum += w * (GRID_LAT_MAX - (float)r * GRID_LAT_STEP);
+      lonSum += w * (GRID_LON_MIN + (float)c * GRID_LON_STEP);
+    }
+  }
+
+  outLat       = latSum / wsum;
+  outLon       = lonSum / wsum;
+  outCenterMsl = msl[mi];   // conservative: node value, not interpolated
+  outMinIdx    = mi;
+  return true;
 }
 
-static void evaluateStormScan(float centerMsl, const float ringMsl[4]) {
-  const float ringMean   = (ringMsl[0] + ringMsl[1] + ringMsl[2] + ringMsl[3]) * 0.25f;
-  const float rawDeficit = ringMean - centerMsl;
+static void applyScan(const float msl[GRID_POINTS], const float wind[GRID_POINTS]) {
+  float lat, lon, centerMsl;
+  uint8_t mi;
 
-  // Median-of-3 rejects single-sample glitches (model update jumps etc.)
-  g_defHist[g_defNext] = rawDeficit;
-  g_defNext = (uint8_t)((g_defNext + 1) % 3);
-  if (g_defCount < 3) g_defCount++;
-  if (g_defCount < 3) return;              // ~30 min of history needed
-
-  g_deficit = median3(g_defHist[0], g_defHist[1], g_defHist[2]);
-
-  // Bearing toward the lowest ring sector: rough steer TO the low.
-  // Ring order is N, E, S, W -> bearings 0, 90, 180, 270.
-  uint8_t minIdx = 0;
-  for (uint8_t i = 1; i < 4; i++)
-    if (ringMsl[i] < ringMsl[minIdx]) minIdx = i;
-  const uint8_t bearing = (uint8_t)(minIdx * 90);
-
-  const bool near = (g_deficit >= DEFICIT_NEAR_HPA);
-  if (near != g_stormNear) {
-    Serial.printf("[SCAN] STORM NEAR %s (deficit %+.1f hPa, bearing %03u deg)\n",
-                  near ? "ON" : "off", (double)g_deficit, (unsigned)bearing);
-    g_stormNear = near;
+  if (!detectLow(msl, lat, lon, centerMsl, mi)) {
+    if (g_stormTracked) {
+      Serial.println("[SCAN] No low detected - tracker cleared");
+      g_stormTracked = false;
+      g_histCount   = 0;              // trend restarts with the next system
+      g_trendValid  = false;
+      g_trendFast   = false;
+    }
+    return;
   }
-  g_stormBearing = near ? bearing : 255;
 
-  Serial.printf("[SCAN] center=%.1f ring=%.1f deficit=%+.1f smooth=%+.1f %s\n",
-                (double)centerMsl, (double)ringMean,
-                (double)rawDeficit, (double)g_deficit, near ? "NEAR" : "");
+  g_stormTracked = true;
+  g_stormLat     = lat;
+  g_stormLon     = lon;
+  g_stormMsl     = centerMsl;
+  g_stormWind    = wind[mi];
+  Serial.printf("[SCAN] Low @ %.1fN %.1fE  central %.1f hPa, %.0f km/h\n",
+                (double)lat, (double)lon, (double)centerMsl, (double)g_stormWind);
+
+  // --- Deepening/filling trend of the tracked system -----------------
+  pushPressureSample(centerMsl);
+  float rate;
+  if (pressureTrend(rate)) {
+    g_trendRate  = rate;
+    g_trendValid = true;
+    g_trendFast  = (rate <= -TREND_FAST_HPA_H);
+    Serial.printf("[NET] Trend %+.1f hPa/h%s\n", (double)rate,
+                  g_trendFast ? "  << RAPID DEEPENING" : "");
+  }
+
+  // --- Alert evaluation -----------------------------------------------
+  const bool newAlert = (centerMsl < ALERT_PRESSURE_HPA);
+  if (newAlert != g_alertActive) {
+    g_alertActive = newAlert;
+    Serial.printf("[ALERT] %s (central %.1f hPa)\n",
+                  newAlert ? "ACTIVE" : "cleared", (double)centerMsl);
+  }
+  // Recovering above the threshold always clears the mute
+  if (!g_alertActive && g_isMuted) {
+    g_isMuted = false;
+    Serial.println("[ALERT] Mute auto-reset (system weakened)");
+  }
 }
 
 static void handleFetchSchedule(unsigned long now) {
@@ -499,39 +542,10 @@ static void handleFetchSchedule(unsigned long now) {
   g_lastFetchMs  = now;
   g_neverFetched = false;
 
-  float p, w, centerMsl, ringMsl[4];
-  g_lastFetchOk = fetchScan(p, w, centerMsl, ringMsl);
+  float msl[GRID_POINTS], wind[GRID_POINTS];
+  g_lastFetchOk = fetchParScan(msl, wind);
   if (g_lastFetchOk) {
-    g_pressureHpA = p;
-    g_windKmh     = w;
-    g_haveData    = true;
-
-    // --- Pressure trend ---------------------------------------------
-    pushPressureSample(p);
-    float rate;
-    if (pressureTrend(rate)) {
-      g_trendRate  = rate;
-      g_trendValid = true;
-      g_trendFast  = (rate <= -TREND_FAST_HPA_H);
-      Serial.printf("[NET] Trend %+.1f hPa/h%s\n", (double)rate,
-                    g_trendFast ? "  << FAST FALL" : "");
-    }
-
-    // --- Storm proximity scan ---------------------------------------
-    evaluateStormScan(centerMsl, ringMsl);
-
-    // --- Alert evaluation -------------------------------------------
-    const bool newAlert = (p < ALERT_PRESSURE_HPA);
-    if (newAlert != g_alertActive) {
-      g_alertActive = newAlert;
-      Serial.printf("[ALERT] %s (P=%.1f hPa)\n",
-                    newAlert ? "ACTIVE" : "cleared", p);
-    }
-    // Auto-reset: recovering above the threshold always clears the mute
-    if (!g_alertActive && g_isMuted) {
-      g_isMuted = false;
-      Serial.println("[ALERT] Mute auto-reset (pressure recovered)");
-    }
+    applyScan(msl, wind);
     g_redraw = true;
   }
 }
@@ -619,9 +633,10 @@ static void drawHeader() {
       drawBanner("ALERT <1000", false);                    // alternate phase
     }
   } else {
-    // STORM NEAR: steady inverted banner (the full alert flashes instead)
-    if (g_stormNear) drawBanner("STORM NEAR", true);
-    else             centerText("PH TYPHOON TRACKER", 1, SSD1306_WHITE);
+    // LPA IN PAR: steady inverted banner (a typhoon-strength system
+    // triggers the flashing alert machinery instead)
+    if (g_stormTracked) drawBanner("LPA IN PAR", true);
+    else                centerText("PH TYPHOON TRACKER", 1, SSD1306_WHITE);
     // WiFi status pip, top-right corner
     if (g_wifiUp) display.fillCircle(123, 5, 2, SSD1306_WHITE);
     else          display.drawCircle(123, 5, 2, SSD1306_WHITE);
@@ -635,16 +650,16 @@ static void drawTelemetrySidebar() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  if (g_haveData) {
-    snprintf(buf, sizeof(buf), "P:%.1fhPa", (double)g_pressureHpA);
+  if (g_stormTracked) {
+    snprintf(buf, sizeof(buf), "P:%.1fhPa", (double)g_stormMsl);
   } else {
     snprintf(buf, sizeof(buf), "P:--hPa");
   }
   display.setCursor(SB_X + 3, SB_Y + 1);
   display.print(buf);
 
-  if (g_haveData) {
-    snprintf(buf, sizeof(buf), "W:%.0fkm/h", (double)g_windKmh);
+  if (g_stormTracked) {
+    snprintf(buf, sizeof(buf), "W:%.0fkm/h", (double)g_stormWind);
   } else {
     snprintf(buf, sizeof(buf), "W:--km/h");
   }
@@ -658,24 +673,6 @@ static void drawTelemetrySidebar() {
     display.setCursor(SB_X + 3, SB_Y + 17);
     display.print(buf);
   }
-}
-
-/* Small arrow from the target toward the inferred bearing of the low.
- * Screen direction: x = sin(bearing), y = -cos(bearing) (north = up). */
-static void drawBearingArrow(int16_t cx, int16_t cy, uint8_t bearingDeg) {
-  const float rad = bearingDeg * DEG_TO_RAD;
-  const float dx = sinf(rad), dy = -cosf(rad);   // unit vector, screen coords
-  const float px = -dy, py = dx;                 // perpendicular
-
-  const int16_t tipX = cx + (int16_t)lroundf(dx * 13.0f);
-  const int16_t tipY = cy + (int16_t)lroundf(dy * 13.0f);
-  const int16_t b1X  = cx + (int16_t)lroundf(dx * 8.0f + px * 3.5f);
-  const int16_t b1Y  = cy + (int16_t)lroundf(dy * 8.0f + py * 3.5f);
-  const int16_t b2X  = cx + (int16_t)lroundf(dx * 8.0f - px * 3.5f);
-  const int16_t b2Y  = cy + (int16_t)lroundf(dy * 8.0f - py * 3.5f);
-
-  display.fillCircle(cx, cy, 7, SSD1306_BLACK);  // clear space under arrow
-  display.fillTriangle(tipX, tipY, b1X, b1Y, b2X, b2Y, SSD1306_WHITE);
 }
 
 /* Animated counter-clockwise radar-swirl cyclone marker.
@@ -731,13 +728,10 @@ static void render() {
   // 1. Static map background (full 128x64, PAR bounds = screen edges)
   display.drawBitmap(0, 0, PH_MAP, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
 
-  // 2. Animated cyclone marker at the mapped target coordinates
-  const int16_t cx = lonToX(TARGET_LON), cy = latToY(TARGET_LAT);
-  drawCyclone(cx, cy);
-
-  // 2b. Bearing arrow toward the inferred low (storm-near state only)
-  if (g_stormNear && g_stormBearing != 255)
-    drawBearingArrow(cx, cy, g_stormBearing);
+  // 2. Detected system only - a clean map means no storm is tracked.
+  //    The marker sits at the estimated position of the low.
+  if (g_stormTracked)
+    drawCyclone(lonToX(g_stormLon), latToY(g_stormLat));
 
   // 3. North indicator (top-right, over open water east of Luzon)
   drawNorthIndicator();
@@ -770,16 +764,11 @@ void setup() {
     while (true) { /* halt: nothing to show on */ }
   }
 
-  // Splash (tracked coordinates shown here; the sidebar row they used
-  // to occupy now carries the live pressure trend)
-  char coordBuf[18];
-  snprintf(coordBuf, sizeof(coordBuf), "%.1fN %.1fE",
-           (double)TARGET_LAT, (double)TARGET_LON);
+  // Splash
   display.clearDisplay();
-  centerText("PH TYPHOON", 8, SSD1306_WHITE);
-  centerText("TRACKER v1.2", 22, SSD1306_WHITE);
-  centerText(coordBuf, 36, SSD1306_WHITE);
-  centerText(WIFI_SSID, 46, SSD1306_WHITE);
+  centerText("PH TYPHOON", 12, SSD1306_WHITE);
+  centerText("TRACKER v1.4", 26, SSD1306_WHITE);
+  centerText(WIFI_SSID, 44, SSD1306_WHITE);
   display.display();
 
   // Initial WiFi association - bounded, non-blocking wait with progress dots
@@ -824,13 +813,19 @@ void loop() {
 
   handleSiren(now);          // 1.2 kHz <-> 2.4 kHz alternation
 
-  // Animation + banner blink timers.
+  // UI tick. Drives the swirl animation only while a typhoon-strength
+  // system is alerting; an LPA marker stays frozen and calm weather is
+  // fully static except for a blinking rapid-deepening trend row.
   // Frame counter wraps at 12 because the swirl steps 30 deg/frame:
   // 12 x 30 deg = 360 deg, so the rotation is seamless across the wrap.
-  if ((now - g_animLastMs) >= ANIM_FRAME_MS) {
+  if (g_alertActive && (now - g_animLastMs) >= ANIM_FRAME_MS) {
     g_animLastMs = now;
-    g_animFrame = (g_animFrame + 1) % 12;
-    g_redraw = true;
+    g_animFrame  = (uint8_t)((g_animFrame + 1) % 12);
+    g_redraw     = true;
+  } else if (!g_alertActive && g_trendFast &&
+             (now - g_animLastMs) >= TREND_BLINK_MS) {
+    g_animLastMs = now;
+    g_redraw     = true;
   }
   if (g_alertActive && !g_isMuted && (now - g_blinkLastMs) >= HEADER_BLINK_MS) {
     g_blinkLastMs = now;
