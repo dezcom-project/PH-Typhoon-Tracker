@@ -12,6 +12,8 @@
  *      * flashing "!TYPHOON!" / "ALERT <1000" header banner
  *      * dual-tone siren (1.2 kHz <-> 2.4 kHz, 250 ms alternation)
  *  - Push-button mute with 50 ms software debounce + auto-reset on recovery
+ *  - 60-minute pressure-trend readout (hPa/h); the row blinks during a
+ *    rapid barometric fall (>= 2 hPa/h) BEFORE the 1000 hPa alert fires
  *  - Fully non-blocking: every timing decision uses millis().
  *    There are NO delay() calls anywhere in loop().
  *
@@ -87,6 +89,10 @@ const unsigned long HEADER_BLINK_MS   = 600UL;     // alert banner blink rate
 const unsigned long ANIM_FRAME_MS     = 150UL;     // cyclone swirl animation
 const unsigned long DEBOUNCE_MS       = 50UL;      // button debounce time
 
+/* ---------------- Pressure trend ---------------- */
+const float TREND_FAST_HPA_H = 2.0f;        // faster fall blinks the row
+const unsigned long TREND_BLINK_MS = 400UL; // fast-fall blink period
+
 /* ---------------- Siren tones (Hz) ---------------- */
 const unsigned int SIREN_FREQ_LOW  = 1200;
 const unsigned int SIREN_FREQ_HIGH = 2400;
@@ -99,6 +105,13 @@ const float PAR_LAT_MIN = 4.5f,   PAR_LAT_MAX = 21.5f;
 
 /* ---------------- Telemetry sidebar geometry ---------------- */
 const int16_t SB_X = 0, SB_Y = 40, SB_W = 76, SB_H = 24;
+
+/* ---------------- Pressure-trend history ---------------- */
+// One sample per successful fetch (10 min apart); 7 samples span 60 min.
+const uint8_t TREND_SAMPLES = 7;
+float   g_hist[TREND_SAMPLES];   // ring buffer of surface pressures
+uint8_t g_histCount = 0;         // valid samples (caps at TREND_SAMPLES)
+uint8_t g_histNext  = 0;         // next write slot (= oldest slot when full)
 
 /* ============================================================
  *  LEDC buzzer wrappers (core 3.x pin-based API, 2.x fallback)
@@ -255,6 +268,9 @@ bool         g_haveData     = false;  // at least one successful fetch
 bool         g_lastFetchOk  = true;
 bool         g_neverFetched = true;
 unsigned long g_lastFetchMs = 0;
+float        g_trendRate    = 0.0f;   // hPa/h across the last full window
+bool         g_trendValid   = false;  // true once 60 min of history exists
+bool         g_trendFast    = false;  // barometer falling >= TREND_FAST_HPA_H
 
 // Alert / mute state machine
 bool g_alertActive = false;
@@ -291,6 +307,26 @@ static int16_t lonToX(float lon) {
 static int16_t latToY(float lat) {
   float y = (PAR_LAT_MAX - lat) * (SCREEN_HEIGHT - 1) / (PAR_LAT_MAX - PAR_LAT_MIN);
   return (int16_t)constrain(lroundf(y), 0, SCREEN_HEIGHT - 1);
+}
+
+/* ============================================================
+ *  PRESSURE TREND - 60-minute rolling window
+ *  A steadily falling barometer is the classic advance signal that
+ *  a deepening low (tropical disturbance) is approaching.
+ * ============================================================ */
+static void pushPressureSample(float p) {
+  g_hist[g_histNext] = p;
+  g_histNext = (uint8_t)((g_histNext + 1) % TREND_SAMPLES);
+  if (g_histCount < TREND_SAMPLES) g_histCount++;
+}
+
+// True once a full hour of samples exists; rate is hPa per hour,
+// positive = rising. Right after a push, g_histNext points at the
+// oldest sample in the window.
+static bool pressureTrend(float &rateHpAPerHour) {
+  if (g_histCount < TREND_SAMPLES) return false;
+  rateHpAPerHour = g_pressureHpA - g_hist[g_histNext];
+  return true;
 }
 
 /* ============================================================
@@ -370,6 +406,17 @@ static void handleFetchSchedule(unsigned long now) {
     g_pressureHpA = p;
     g_windKmh     = w;
     g_haveData    = true;
+
+    // --- Pressure trend ---------------------------------------------
+    pushPressureSample(p);
+    float rate;
+    if (pressureTrend(rate)) {
+      g_trendRate  = rate;
+      g_trendValid = true;
+      g_trendFast  = (rate <= -TREND_FAST_HPA_H);
+      Serial.printf("[NET] Trend %+.1f hPa/h%s\n", (double)rate,
+                    g_trendFast ? "  << FAST FALL" : "");
+    }
 
     // --- Alert evaluation -------------------------------------------
     const bool newAlert = (p < ALERT_PRESSURE_HPA);
@@ -500,9 +547,13 @@ static void drawTelemetrySidebar() {
   display.setCursor(SB_X + 3, SB_Y + 9);
   display.print(buf);
 
-  snprintf(buf, sizeof(buf), "%.1fN %.1fE", (double)TARGET_LAT, (double)TARGET_LON);
-  display.setCursor(SB_X + 3, SB_Y + 17);
-  display.print(buf);
+  // Row 3: 60-min pressure trend. Hidden until a full window exists;
+  // blinks during a fast fall so it reads as a warning, not just data.
+  if (g_trendValid && !(g_trendFast && ((millis() / TREND_BLINK_MS) & 1))) {
+    snprintf(buf, sizeof(buf), "T:%+.1fhPa/h", (double)g_trendRate);
+    display.setCursor(SB_X + 3, SB_Y + 17);
+    display.print(buf);
+  }
 }
 
 /* Animated counter-clockwise radar-swirl cyclone marker.
@@ -592,11 +643,16 @@ void setup() {
     while (true) { /* halt: nothing to show on */ }
   }
 
-  // Splash
+  // Splash (tracked coordinates shown here; the sidebar row they used
+  // to occupy now carries the live pressure trend)
+  char coordBuf[18];
+  snprintf(coordBuf, sizeof(coordBuf), "%.1fN %.1fE",
+           (double)TARGET_LAT, (double)TARGET_LON);
   display.clearDisplay();
-  centerText("PH TYPHOON", 12, SSD1306_WHITE);
-  centerText("TRACKER v1.0", 26, SSD1306_WHITE);
-  centerText(WIFI_SSID, 44, SSD1306_WHITE);
+  centerText("PH TYPHOON", 8, SSD1306_WHITE);
+  centerText("TRACKER v1.1", 22, SSD1306_WHITE);
+  centerText(coordBuf, 36, SSD1306_WHITE);
+  centerText(WIFI_SSID, 46, SSD1306_WHITE);
   display.display();
 
   // Initial WiFi association - bounded, non-blocking wait with progress dots

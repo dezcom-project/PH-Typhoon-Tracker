@@ -18,6 +18,9 @@ surface pressure drops below 1000 hPa.
   plays an alternating 1.2 kHz / 2.4 kHz siren every 250 ms
 - **Mute button** — debounced push-button silences the siren while the visual
   alert keeps flashing; mute auto-clears when pressure recovers ≥ 1000 hPa
+- **Pressure trend** — 60-minute rolling barometer readout (`T:-1.4hPa/h` in
+  the sidebar); a fall of ≥ 2 hPa/h blinks the row as an early warning before
+  the 1000 hPa alert threshold is reached
 - **Fully non-blocking** — no `delay()` in `loop()`; everything is scheduled
   with `millis()`
 
@@ -122,6 +125,16 @@ Threshold applies to Open-Meteo's `surface_pressure`. At coastal targets that
 tracks sea-level pressure closely; if you place the target at altitude,
 consider swapping the query field to `pressure_msl`.
 
+### Early warning: pressure trend
+
+The sidebar's third row shows the surface-pressure change over the last
+60 minutes (7 samples, one per 10-minute fetch). It stays blank until a full
+hour of history has accumulated after boot — that is normal, not a fault.
+A sustained fall is the classic advance signal of an approaching low; once
+the drop reaches **2 hPa/h or faster**, the row blinks (400 ms period) to
+flag it before the 1000 hPa alert state itself triggers. The tracked
+coordinates were moved to the boot splash to make room for this row.
+
 ## API notes
 
 Request (no key):
@@ -134,6 +147,13 @@ Responses are sanity-checked (850–1100 hPa, 0–500 km/h) before being trusted
 failed fetches keep the last good values on screen and retry after 1 minute
 instead of waiting the full 10. TLS uses `setInsecure()` since the endpoint is
 public and read-only.
+
+**Gotcha: chunked responses.** Open-Meteo replies with
+`Transfer-Encoding: chunked` and no `Content-Length`. The body must be read
+with `http.getString()`, which de-chunks via `HTTPClient::writeToStream()`;
+parsing `http.getStream()` directly feeds the raw hex chunk sizes to the JSON
+parser and fails with `InvalidInput`. The request also sends
+`Accept-Encoding: identity` so the server never compresses the payload.
 
 ## Repository layout
 
