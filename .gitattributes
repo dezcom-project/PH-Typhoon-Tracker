@@ -1,0 +1,2 @@
+# Keep the hook script executable as POSIX sh on any platform
+githooks/pre-commit text eol=lf

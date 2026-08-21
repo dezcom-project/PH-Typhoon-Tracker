@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# Pre-commit guard: keeps Wi-Fi credentials out of the repository.
+# Activated with:  git config core.hooksPath githooks
+#
+# Blocking rules:
+#   1. include/secrets.h must never be staged.
+#   2. Added lines may reference WIFI_SSID / WIFI_PASSWORD only together
+#      with the YOUR_WIFI_* placeholder values.
+# Warning rule:
+#   3. Other password/secret/token assignments in added lines are flagged
+#      for manual review but do not block the commit.
+
+set -u
+fail=0
+
+# --- Rule 1: the credentials file itself ---------------------------------
+if git diff --cached --name-only | grep -qE '(^|/)secrets\.h$'; then
+    echo "pre-commit: BLOCKED - include/secrets.h is staged." >&2
+    echo "            Credentials must never enter git history." >&2
+    echo "            Unstage it:  git restore --staged include/secrets.h" >&2
+    fail=1
+fi
+
+# --- Rule 2: real credentials in added lines -----------------------------
+offenders=$(git diff --cached -U0 \
+    | grep -E '^\+.*WIFI_' \
+    | grep '"' \
+    | grep -v 'YOUR_WIFI' || true)
+if [ -n "$offenders" ]; then
+    echo "pre-commit: BLOCKED - staged change adds a real Wi-Fi credential:" >&2
+    echo "$offenders" | sed 's/^/+ /' >&2
+    echo "" >&2
+    echo "            Credentials belong in include/secrets.h (git-ignored)," >&2
+    echo "            never in tracked files." >&2
+    fail=1
+fi
+
+# --- Rule 3: generic secret heuristic (warning only) ---------------------
+suspicious=$(git diff --cached -U0 \
+    | grep -Ei '^\+' \
+    | grep -Ei '(password|secret|token|api[_-]?key)[[:space:]]*[=:]' \
+    | grep -Eiv 'YOUR_|placeholder|example|template' || true)
+if [ -n "$suspicious" ] && [ "$fail" -eq 0 ]; then
+    echo "pre-commit: WARNING - review these staged lines for secrets:" >&2
+    echo "$suspicious" | sed 's/^/? /' >&2
+fi
+
+exit $fail

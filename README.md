@@ -142,6 +142,21 @@ platformio.ini                 PlatformIO env (esp32dev, lib_deps, flags)
 src/main.cpp                   Firmware (single file, bitmap embedded)
 include/secrets.h.example      Wi-Fi credentials template
 include/secrets.h              Your real credentials (git-ignored, create it)
+githooks/pre-commit            Blocks credentials from being committed
 tools/gen_map.ps1              Map rasterizer (polygons -> C PROGMEM array)
 tools/ph_map_bitmap.txt        Last generator output (for diffing)
 ```
+
+## Credential guard
+
+A pre-commit hook keeps credentials out of git history. Activate it once per
+clone (already active in this working copy):
+
+```
+git config core.hooksPath githooks
+```
+
+It **blocks** commits that stage `include/secrets.h` or add any line pairing
+`WIFI_SSID` / `WIFI_PASSWORD` with a non-placeholder value, and it **warns**
+on other password/secret/token-looking assignments. The placeholder strings
+(`YOUR_WIFI_*`) are always allowed, so normal development never trips it.
