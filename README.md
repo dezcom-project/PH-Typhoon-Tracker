@@ -21,6 +21,10 @@ surface pressure drops below 1000 hPa.
 - **Pressure trend** — 60-minute rolling barometer readout (`T:-1.4hPa/h` in
   the sidebar); a fall of ≥ 2 hPa/h blinks the row as an early warning before
   the 1000 hPa alert threshold is reached
+- **Storm proximity scan** — one multi-point Open-Meteo request samples
+  sea-level pressure at the target plus a 4-point ring ~275 km out; when the
+  center reads ≥ 2 hPa below the ring (median-smoothed), the header shows a
+  steady `STORM NEAR` banner and an arrow points toward the inferred low
 - **Fully non-blocking** — no `delay()` in `loop()`; everything is scheduled
   with `millis()`
 
@@ -117,9 +121,34 @@ fresh reading ≥ 1000 hPa force-clears the mute (auto-reset).
 
 | Condition | Header | Buzzer |
 | --- | --- | --- |
-| P ≥ 1000 hPa | `PH TYPHOON TRACKER` + Wi-Fi pip | silent |
+| P ≥ 1000 hPa, no scan hit | `PH TYPHOON TRACKER` + Wi-Fi pip | silent |
+| Ring−center deficit ≥ 2 hPa (smoothed) | steady `STORM NEAR` + bearing arrow | silent |
 | P < 1000 hPa | alternates `!TYPHOON!` (inverted) / `ALERT <1000` every 600 ms | 1.2 kHz ↔ 2.4 kHz every 250 ms |
 | P < 1000 hPa, muted | steady `TYPH [MUTED]` | silent |
+
+Severity hierarchy: `STORM NEAR` is informational and steady; the full alert
+flashes and sounds. If both conditions hold, the alert banner wins.
+
+### Storm proximity scan
+
+Every fetch also samples **sea-level-reduced pressure** (`pressure_msl`) at
+five points in one request: the target plus N/E/S/W ring points 2.5° away
+(~275 km; the longitude step is widened by 1/cos(lat) to keep ground
+distances equal). The deficit `mean(ring) − center` isolates a local deep
+low: diurnal and broad-scale pressure swings lift all five points together
+and cancel out.
+
+- Raw deficits pass through a **median-of-3 filter** (3 scans ≈ 30 min), so
+  the state needs half an hour of uptime and single glitches can't trip it
+- Deficit ≥ 2 hPa → `STORM NEAR`, and the arrow on the map points at the
+  lowest ring sector — a rough bearing *toward* the low
+- `pressure_msl` is mandatory here, not `surface_pressure`: raw surface
+  pressure tracks terrain elevation, so a ring point over the Cordillera
+  (~1800 m) reads ~90 hPa "low" in perfectly fair weather
+
+This is inference from the pressure field, not an official storm position —
+treat it as a hint that something organized is within roughly ring distance,
+not a track forecast.
 
 Threshold applies to Open-Meteo's `surface_pressure`. At coastal targets that
 tracks sea-level pressure closely; if you place the target at altitude,
@@ -137,10 +166,18 @@ coordinates were moved to the boot splash to make room for this row.
 
 ## API notes
 
-Request (no key):
+Request (no key) — single point, used for the display/alert pressure:
 
 ```
 https://api.open-meteo.com/v1/forecast?latitude=14.60&longitude=120.98&current=surface_pressure,wind_speed_10m&wind_speed_unit=kmh
+```
+
+The storm scan uses the same endpoint with **comma-separated coordinates**,
+which returns a JSON *array* of per-location objects (one HTTPS round trip
+for all five points):
+
+```
+https://api.open-meteo.com/v1/forecast?latitude=14.60,17.10,...&longitude=120.98,120.98,...&current=pressure_msl,surface_pressure,wind_speed_10m&wind_speed_unit=kmh
 ```
 
 Responses are sanity-checked (850–1100 hPa, 0–500 km/h) before being trusted;
