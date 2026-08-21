@@ -2,6 +2,9 @@
 .pio/
 build/
 
+# Private credentials - never commit
+include/secrets.h
+
 # Editor / OS noise
 .vscode/
 .DS_Store

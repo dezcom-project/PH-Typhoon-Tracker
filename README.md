@@ -53,13 +53,15 @@ from the DevKit's 3V3 regulator.
    folder — `platformio.ini` is detected automatically and all libraries from
    `lib_deps` (Adafruit GFX, Adafruit SSD1306, ArduinoJson v7) install on the
    first build.
-2. Edit the USER CONFIGURATION block at the top of `src/main.cpp`:
-   - `WIFI_SSID` / `WIFI_PASSWORD` (2.4 GHz networks only)
+2. Create your credentials file (git-ignored, stays out of the repo):
+   `Copy-Item include\secrets.h.example include\secrets.h` and fill in
+   `WIFI_SSID` / `WIFI_PASSWORD` (2.4 GHz networks only).
+3. Edit the remaining USER CONFIGURATION block at the top of `src/main.cpp`:
    - `TARGET_LAT` / `TARGET_LON` — the storm/LPA point to track
-3. Build: **PlatformIO: Build** (or `pio run`).
-4. Flash: connect the DevKit over USB and run **PlatformIO: Upload**
+4. Build: **PlatformIO: Build** (or `pio run`).
+5. Flash: connect the DevKit over USB and run **PlatformIO: Upload**
    (or `pio run -t upload`).
-5. Serial monitor @115200 for diagnostics (`pio device monitor`).
+6. Serial monitor @115200 for diagnostics (`pio device monitor`).
 
 ## Coordinate mapping math
 
@@ -138,6 +140,8 @@ public and read-only.
 ```
 platformio.ini                 PlatformIO env (esp32dev, lib_deps, flags)
 src/main.cpp                   Firmware (single file, bitmap embedded)
+include/secrets.h.example      Wi-Fi credentials template
+include/secrets.h              Your real credentials (git-ignored, create it)
 tools/gen_map.ps1              Map rasterizer (polygons -> C PROGMEM array)
 tools/ph_map_bitmap.txt        Last generator output (for diffing)
 ```

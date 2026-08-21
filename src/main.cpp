@@ -45,8 +45,16 @@
 /* ============================================================
  *  USER CONFIGURATION - edit these before flashing
  * ============================================================ */
-#define WIFI_SSID       "YOUR_WIFI_SSID"     // <-- your 2.4 GHz WiFi name
-#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD" // <-- your WiFi password
+// Wi-Fi credentials live in include/secrets.h (git-ignored, so your
+// password never lands in the repository). Copy include/secrets.h.example
+// to include/secrets.h and fill it in. Placeholders are used otherwise.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #pragma message("secrets.h not found - building with PLACEHOLDER Wi-Fi credentials")
+  #define WIFI_SSID       "YOUR_WIFI_SSID"
+  #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
+#endif
 
 // Target point inside the PAR that is tracked and sampled.
 // Default: Metro Manila. Move this to any storm/LPA coordinate you want.
